@@ -125,5 +125,5 @@ SAMBA_VERSION_RELEASE_NICKNAME=
 #  ->  "3.0.0rc2-VendorVersion"                        #
 #                                                      #
 ########################################################
-SAMBA_VERSION_VENDOR_SUFFIX=ibm.1
+SAMBA_VERSION_VENDOR_SUFFIX=ibm.2
 SAMBA_VERSION_VENDOR_PATCH=
