@@ -5043,11 +5043,7 @@ static NTSTATUS smbd_smb2_flush_send_queue(struct smbXsrv_connection *xconn)
 	 */
 
 	status = smbd_smb2_request_next_incoming(xconn);
-	if (!NT_STATUS_IS_OK(status)) {
-		return status;
-	}
-
-	return NT_STATUS_OK;
+	return status;
 }
 
 static NTSTATUS smbd_smb2_advance_incoming(struct smbXsrv_connection *xconn, size_t n)
@@ -5243,11 +5239,7 @@ got_full:
 	}
 
 	status = smbd_smb2_request_next_incoming(xconn);
-	if (!NT_STATUS_IS_OK(status)) {
-		return status;
-	}
-
-	return NT_STATUS_OK;
+	return status;
 }
 
 static NTSTATUS smbd_smb2_io_handler(struct smbXsrv_connection *xconn,
@@ -5350,11 +5342,8 @@ again:
 		 */
 		goto again;
 	}
-	if (!NT_STATUS_IS_OK(status)) {
-		return status;
-	}
 
-	return NT_STATUS_OK;
+	return status;
 }
 
 static void smbd_smb2_connection_handler(struct tevent_context *ev,
