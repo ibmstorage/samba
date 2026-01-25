@@ -295,15 +295,6 @@ _PUBLIC_ size_t ascii_len_n(const char *src, size_t n);
 _PUBLIC_ bool set_boolean(const char *boolean_string, bool *boolean);
 
 /**
- * Parse a string containing a boolean value.
- *
- * val will be set to the read value.
- *
- * @retval true if a boolean value was parsed, false otherwise.
- */
-_PUBLIC_ bool conv_str_bool(const char * str, bool * val);
-
-/**
  * Returns a pointer to the first invalid character in name.
  *
  * Passing a NULL pointer as name is not allowed!
