@@ -318,15 +318,6 @@ _PUBLIC_ const char *strstr_for_invalid_account_characters(const char *name);
 _PUBLIC_ bool conv_str_size_error(const char * str, uint64_t * val);
 
 /**
- * Parse a uint64_t value from a string
- *
- * val will be set to the value read.
- *
- * @retval true if parsing was successful, false otherwise
- */
-_PUBLIC_ bool conv_str_u64(const char * str, uint64_t * val);
-
-/**
  * @brief Constant time compare to memory regions.
  *
  * @param[in]  s1  The first memory region to compare.
