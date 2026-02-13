@@ -155,6 +155,13 @@ interface messaging
 		MSG_DREPL_ALLOCATE_RID          = 0x0704,
 
 		/*
+		 * VFS aio_ratelimit cluster coordination messages
+		 * Node-level aggregation via ratelimitd daemon
+		 */
+		MSG_VFS_AIO_RATELIMIT_READ_NODE_SUMMARY	= 0x0900,
+		MSG_VFS_AIO_RATELIMIT_WRITE_NODE_SUMMARY = 0x0901,
+
+		/*
 		 * Audit, Authentication and Authorisation event
 		 * messages
 		 */
