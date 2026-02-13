@@ -1,5 +1,5 @@
 /*
- * Asynchronous I/O rate-limiting VFS module.
+ * Asynchronous I/O rate-limiting VFS module with cluster-wide coordination.
  *
  * Copyright (c) 2025 Shachar Sharon <ssharon@redhat.com>
  * Copyright (c) 2025 Avan Thakkar <athakkar@redhat.com>
@@ -19,7 +19,7 @@
  */
 
 /*
-  Token-base rate-limiter using Samba's VFS stack-able module. For each samba
+  Token-based rate-limiter using Samba's VFS stack-able module. For each samba
   share a user may define READ/WRITE thresholds in terms of IOPS or BYTES
   per-second. If one of those thresholds is exceeded along the asynchronous
   I/O path, a delay is injected before sending back a reply to the caller,
@@ -32,6 +32,18 @@
   Rate-limiter state (token counters and timestamps) is periodically
   persisted to a local TDB, allowing limits to be enforced consistently
   across client reconnects and smbd restarts.
+
+  CLUSTER-WIDE COORDINATION VIA DAEMON:
+  In cluster mode, each smbd process reports its activity to a local
+  ratelimitd daemon via Unix socket. The daemon aggregates activity from
+  all smbd processes on the node and broadcasts node-level summaries to
+  other nodes via Samba's messaging system. This reduces network message
+  volume from O(N²) to O(M²) where N=processes and M=nodes.
+
+  Processes receive node summaries and dynamically recalculate their local
+  rate limits to ensure the global limit is enforced cluster-wide. The
+  global limit is distributed equally among all active smbd processes
+  performing I/O (per-process distribution model).
 
   An example to smb.conf segment (zero value implies ignore-this-option):
 
@@ -56,8 +68,12 @@
 #include "lib/util/time.h"
 #include "lib/util/tevent_unix.h"
 #include "lib/util/util_tdb.h"
+#include "lib/util/server_id.h"
 #include "tdb.h"
+#include "messages.h"
 #include "system/filesys.h"
+#include "lib/global_contexts.h"
+#include "ratelimit_protocol.h"
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_VFS
@@ -82,6 +98,13 @@
 /* TDB schema version */
 #define RATELIMIT_TDB_VERSION 1
 
+/* Activity tracking intervals */
+#define ACTIVITY_BROADCAST_INTERVAL_US (1000000L)
+#define ACTIVITY_TIMEOUT_US (5000000L)
+
+/* Initial capacity for node tracking array (grows dynamically) */
+#define INITIAL_TRACKED_CAPACITY 64
+
 static unsigned int ref_count = 0;
 static TDB_CONTEXT *ratelimit_tdb;
 
@@ -95,6 +118,14 @@ struct ratelimit_tdb_record {
 	uint8_t reserved[64 - (8 + 4 + 4)];
 } PACKED_STRUCT;
 
+/* Node-level tracking */
+struct node_count {
+	uint32_t vnn;
+	int32_t process_count;
+	uint64_t last_seen_us;
+	bool is_active;
+};
+
 /* Token-based rate-limiter control state using a token-bucket. */
 struct ratelimiter {
 	const char *op;
@@ -104,8 +135,10 @@ struct ratelimiter {
 	float bytes_tokens;
 	int64_t iops_total;
 	int64_t bytes_total;
-	int64_t iops_limit;
-	int64_t bw_limit;
+	int64_t global_iops_limit;
+	int64_t global_bw_limit;
+	int64_t local_iops_limit;
+	int64_t local_bw_limit;
 	float iops_capacity;
 	float bytes_capacity;
 
@@ -115,7 +148,30 @@ struct ratelimiter {
 	 * are reconfigured in the future (e.g. reload, per-client limits).
 	 */
 	float burst_mult;
+
 	int snum;
+
+	/* Cluster coordination via daemon */
+	bool cluster_mode;
+	struct messaging_context *msg_ctx;
+	struct server_id my_server_id;
+	int daemon_sock;
+	uint64_t last_report_to_daemon_us;
+
+	/* Activity tracking */
+	uint32_t inflight_ios;
+	int64_t recent_iops;
+
+	struct node_count *node_counts;
+	int num_tracked_nodes;
+	int max_tracked_nodes;
+
+	int num_active_processes;
+
+	/* Statistics */
+	uint64_t total_reports_sent;
+	uint64_t total_summaries_received;
+	uint64_t total_limit_recalcs;
 };
 
 /* In-memory rate-limiting entry per connection */
@@ -130,6 +186,403 @@ static uint64_t time_now_usec(void)
 
 	clock_gettime_mono(&ts);
 	return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+static bool ensure_node_count_capacity(struct ratelimiter *rl)
+{
+	struct node_count *new_array;
+	int new_max;
+
+	if (rl->num_tracked_nodes < rl->max_tracked_nodes) {
+		return true;
+	}
+
+	new_max = rl->max_tracked_nodes * 2;
+
+	new_array = talloc_realloc_zero(NULL,
+					rl->node_counts,
+					struct node_count,
+					new_max);
+	if (new_array == NULL) {
+		DBG_ERR("[%s snum:%d %s] Failed to grow node_counts: %d -> "
+			"%d\n",
+			MODULE_NAME,
+			rl->snum,
+			rl->op,
+			rl->max_tracked_nodes,
+			new_max);
+		return false;
+	}
+
+	rl->node_counts = new_array;
+	rl->max_tracked_nodes = new_max;
+
+	return true;
+}
+
+static void update_node_count(struct ratelimiter *rl,
+			      uint32_t vnn,
+			      int32_t process_count)
+{
+	struct node_count *nc = NULL;
+	uint64_t now = time_now_usec();
+	int i;
+
+	/* Find existing node entry */
+	for (i = 0; i < rl->num_tracked_nodes; i++) {
+		if (rl->node_counts[i].vnn == vnn) {
+			nc = &rl->node_counts[i];
+			break;
+		}
+	}
+
+	if (nc == NULL) {
+		if (!ensure_node_count_capacity(rl)) {
+			return;
+		}
+
+		nc = &rl->node_counts[rl->num_tracked_nodes++];
+		nc->vnn = vnn;
+		nc->is_active = false;
+	}
+
+	nc->process_count = process_count;
+	nc->last_seen_us = now;
+	nc->is_active = (process_count > 0);
+
+	DBG_DEBUG("[%s snum:%d %s] Updated node vnn=%u: count=%d active=%d\n",
+		  MODULE_NAME,
+		  rl->snum,
+		  rl->op,
+		  vnn,
+		  process_count,
+		  nc->is_active);
+}
+
+static int count_active_processes(struct ratelimiter *rl)
+{
+	uint64_t now = time_now_usec();
+	int total_count = 0;
+	int timed_out = 0;
+	bool i_am_active;
+	int i;
+
+	i_am_active = (rl->inflight_ios > 0) || (rl->recent_iops > 0);
+
+	if (i_am_active) {
+		total_count = 1;
+		DBG_DEBUG("[%s snum:%d %s] I am ACTIVE "
+			  "(inflight=%u recent=%" PRId64 ")\n",
+			  MODULE_NAME,
+			  rl->snum,
+			  rl->op,
+			  rl->inflight_ios,
+			  rl->recent_iops);
+	} else {
+		DBG_DEBUG("[%s snum:%d %s] I am IDLE "
+			  "(inflight=%u recent=%" PRId64 ")\n",
+			  MODULE_NAME,
+			  rl->snum,
+			  rl->op,
+			  rl->inflight_ios,
+			  rl->recent_iops);
+	}
+
+	for (i = 0; i < rl->num_tracked_nodes; i++) {
+		struct node_count *nc = &rl->node_counts[i];
+		uint64_t age_us = now - nc->last_seen_us;
+
+		/* Check timeout */
+		if (age_us > ACTIVITY_TIMEOUT_US) {
+			if (nc->is_active) {
+				DBG_NOTICE("[%s snum:%d %s] Node vnn=%u TIMED "
+					   "OUT "
+					   "(age=%" PRIu64 " ms)\n",
+					   MODULE_NAME,
+					   rl->snum,
+					   rl->op,
+					   nc->vnn,
+					   age_us / 1000);
+				nc->is_active = false;
+				timed_out++;
+			}
+			continue;
+		}
+
+		if (!nc->is_active || nc->process_count <= 0) {
+			continue;
+		}
+
+		if (nc->vnn == rl->my_server_id.vnn) {
+			total_count += (nc->process_count - 1);
+		} else {
+			total_count += nc->process_count;
+		}
+	}
+
+	DBG_DEBUG("[%s snum:%d %s] Total=%d active processes "
+		  "(timed_out=%d)\n",
+		  MODULE_NAME,
+		  rl->snum,
+		  rl->op,
+		  MAX(total_count, 1),
+		  timed_out);
+
+	return MAX(total_count, 1);
+}
+
+/* Recalculate local limits based on active processes */
+static void recalculate_local_limits(struct ratelimiter *rl)
+{
+	int new_active = count_active_processes(rl);
+	int64_t old_local_iops;
+	int64_t old_local_bw;
+	float old_iops_cap;
+	float old_bytes_cap;
+	float old_iops_tokens;
+	float old_bytes_tokens;
+
+	if (new_active == rl->num_active_processes) {
+		return;
+	}
+
+	old_local_iops = rl->local_iops_limit;
+	old_local_bw = rl->local_bw_limit;
+	old_iops_cap = rl->iops_capacity;
+	old_bytes_cap = rl->bytes_capacity;
+
+	DBG_DEBUG("[%s snum:%d %s] *** RECALCULATING LIMITS *** "
+		  "Active processes changed: %d -> %d\n",
+		  MODULE_NAME,
+		  rl->snum,
+		  rl->op,
+		  rl->num_active_processes,
+		  new_active);
+
+	rl->num_active_processes = new_active;
+	rl->total_limit_recalcs++;
+
+	/* Equal distribution among processes */
+	rl->local_iops_limit = rl->global_iops_limit / new_active;
+	rl->local_bw_limit = rl->global_bw_limit / new_active;
+
+	rl->iops_capacity = (float)rl->local_iops_limit * rl->burst_mult;
+	rl->bytes_capacity = (float)rl->local_bw_limit * rl->burst_mult;
+
+	old_iops_tokens = rl->iops_tokens;
+	old_bytes_tokens = rl->bytes_tokens;
+
+	rl->iops_tokens = MIN(rl->iops_tokens, rl->iops_capacity);
+	rl->bytes_tokens = MIN(rl->bytes_tokens, rl->bytes_capacity);
+
+	DBG_DEBUG("[%s snum:%d %s] *** LIMITS UPDATED ***\n"
+		  "  IOPS:  local_limit %" PRId64 " -> %" PRId64
+		  " (global=%" PRId64 ")\n"
+		  "         capacity %.2f -> %.2f, tokens %.2f -> %.2f\n"
+		  "  BW:    local_limit %" PRId64 " -> %" PRId64
+		  " (global=%" PRId64 ")\n"
+		  "         capacity %.2f -> %.2f, tokens %.2f -> %.2f\n"
+		  "  Active processes: %d, Total recalcs: %" PRIu64 "\n",
+		  MODULE_NAME,
+		  rl->snum,
+		  rl->op,
+		  old_local_iops,
+		  rl->local_iops_limit,
+		  rl->global_iops_limit,
+		  old_iops_cap,
+		  rl->iops_capacity,
+		  old_iops_tokens,
+		  rl->iops_tokens,
+		  old_local_bw,
+		  rl->local_bw_limit,
+		  rl->global_bw_limit,
+		  old_bytes_cap,
+		  rl->bytes_capacity,
+		  old_bytes_tokens,
+		  rl->bytes_tokens,
+		  rl->num_active_processes,
+		  rl->total_limit_recalcs);
+}
+
+static int connect_to_ratelimitd(void)
+{
+	int sock;
+	struct sockaddr_un addr;
+	char *socket_path = NULL;
+	int ret;
+
+	socket_path = state_path(talloc_tos(), RATELIMITD_SOCKET_NAME);
+	if (socket_path == NULL) {
+		DBG_ERR("[%s] Failed to allocate socket path\n", MODULE_NAME);
+		return -1;
+	}
+
+	sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+	if (sock < 0) {
+		DBG_ERR("[%s] socket() failed: %s\n",
+			MODULE_NAME,
+			strerror(errno));
+		TALLOC_FREE(socket_path);
+		return -1;
+	}
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	strlcpy(addr.sun_path, socket_path, sizeof(addr.sun_path));
+
+	ret = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+	if (ret < 0) {
+		DBG_WARNING("[%s] connect() to ratelimitd failed: %s\n",
+			    MODULE_NAME,
+			    strerror(errno));
+		close(sock);
+		TALLOC_FREE(socket_path);
+		return -1;
+	}
+
+	DBG_DEBUG("[%s] Connected to ratelimitd: socket=%s\n",
+		  MODULE_NAME,
+		  socket_path);
+
+	TALLOC_FREE(socket_path);
+	return sock;
+}
+
+static void report_to_daemon(struct ratelimiter *rl)
+{
+	struct ratelimit_activity_report report = {0};
+	ssize_t ret;
+
+	if (rl->daemon_sock < 0) {
+		DBG_DEBUG("[%s snum:%d %s] report_to_daemon: daemon_sock "
+			  "invalid, aborting\n",
+			  MODULE_NAME,
+			  rl->snum,
+			  rl->op);
+		return;
+	}
+
+	/* Build report */
+	report.protocol_version = RATELIMIT_PROTOCOL_VERSION;
+	report.pid = (int32_t)getpid();
+	report.snum = rl->snum;
+	report.operation = ratelimit_op_from_string(rl->op);
+	report.recent_iops = rl->recent_iops;
+	report.inflight_ios = rl->inflight_ios;
+	report.timestamp_usec = time_now_usec();
+
+	/* Send to daemon */
+	ret = send(rl->daemon_sock, &report, sizeof(report), MSG_DONTWAIT);
+
+	if (ret != sizeof(report)) {
+		DBG_DEBUG("[%s snum:%d %s] report_to_daemon: send failed "
+			  "ret=%zd expected=%zu errno=%d\n",
+			  MODULE_NAME,
+			  rl->snum,
+			  rl->op,
+			  ret,
+			  sizeof(report),
+			  errno);
+
+		if (errno != EAGAIN && errno != EWOULDBLOCK) {
+			DBG_WARNING("[%s snum:%d %s] Failed to report to "
+				    "daemon: %s\n",
+				    MODULE_NAME,
+				    rl->snum,
+				    rl->op,
+				    strerror(errno));
+
+			DBG_DEBUG("[%s snum:%d %s] report_to_daemon: "
+				  "attempting reconnect\n",
+				  MODULE_NAME,
+				  rl->snum,
+				  rl->op);
+
+			close(rl->daemon_sock);
+			rl->daemon_sock = connect_to_ratelimitd();
+
+			if (rl->daemon_sock < 0) {
+				DBG_ERR("[%s snum:%d %s] Reconnect failed, "
+					"cluster coordination lost\n",
+					MODULE_NAME,
+					rl->snum,
+					rl->op);
+			}
+		} else {
+			DBG_DEBUG("[%s snum:%d %s] report_to_daemon: "
+				  "EAGAIN/EWOULDBLOCK - "
+				  "buffer full, dropping report\n",
+				  MODULE_NAME,
+				  rl->snum,
+				  rl->op);
+		}
+		return;
+	}
+
+	DBG_DEBUG("[%s snum:%d %s] Reported to daemon: "
+		  "recent_iops=%" PRId64 " inflight=%u total_sent=%" PRIu64
+		  "\n",
+		  MODULE_NAME,
+		  rl->snum,
+		  rl->op,
+		  rl->recent_iops,
+		  rl->inflight_ios,
+		  rl->total_reports_sent + 1);
+
+	rl->total_reports_sent++;
+
+	/* Reset recent counter after report */
+	rl->recent_iops = 0;
+	rl->last_report_to_daemon_us = time_now_usec();
+}
+
+static void handle_node_summary_msg(struct messaging_context *msg_ctx,
+				    void *private_data,
+				    uint32_t msg_type,
+				    struct server_id server_id,
+				    DATA_BLOB *data)
+{
+	struct ratelimiter *rl = (struct ratelimiter *)private_data;
+	struct ratelimit_node_summary *summary;
+	int old_active;
+
+	if (data->length != sizeof(struct ratelimit_node_summary)) {
+		DBG_ERR("[%s snum:%d %s] Invalid node summary size %zu "
+			"(expected %zu)\n",
+			MODULE_NAME,
+			rl->snum,
+			rl->op,
+			data->length,
+			sizeof(struct ratelimit_node_summary));
+		return;
+	}
+
+	summary = (struct ratelimit_node_summary *)data->data;
+
+	DBG_DEBUG("[%s snum:%d %s] Received node summary from vnn=%u: "
+		  "process_count=%d (summaries_received=%" PRIu64 ")\n",
+		  MODULE_NAME,
+		  rl->snum,
+		  rl->op,
+		  summary->vnn,
+		  summary->process_count,
+		  rl->total_summaries_received + 1);
+
+	rl->total_summaries_received++;
+
+	old_active = rl->num_active_processes;
+
+	update_node_count(rl, summary->vnn, summary->process_count);
+
+	recalculate_local_limits(rl);
+
+	DBG_DEBUG("[%s snum:%d %s] handle_node_summary_msg: "
+		  "after update num_active=%d (was %d)\n",
+		  MODULE_NAME,
+		  rl->snum,
+		  rl->op,
+		  rl->num_active_processes,
+		  old_active);
 }
 
 static bool ratelimit_tdb_check_version(void)
@@ -342,26 +795,124 @@ static void ratelimit_load_tdb(struct ratelimiter *rl)
 	TALLOC_FREE(key.dptr);
 }
 
-static void ratelimiter_init(struct ratelimiter *rl,
+static void ratelimiter_cleanup(struct ratelimiter *rl)
+{
+	if (rl == NULL) {
+		return;
+	}
+
+	/* Close daemon connection */
+	if (rl->daemon_sock >= 0) {
+		close(rl->daemon_sock);
+		rl->daemon_sock = -1;
+	}
+
+	/* Free node tracking array */
+	TALLOC_FREE(rl->node_counts);
+	rl->num_tracked_nodes = 0;
+	rl->max_tracked_nodes = 0;
+}
+
+static void ratelimiter_init(TALLOC_CTX *mem_ctx,
+			     struct ratelimiter *rl,
 			     int snum,
 			     const char *op,
 			     int64_t iops_limit,
 			     int64_t bw_limit,
-			     float burst_mult)
+			     float burst_mult,
+			     bool cluster_mode_config)
 {
+	bool clustering_enabled = lp_clustering();
+
 	ZERO_STRUCTP(rl);
 	rl->op = op;
 	rl->snum = snum;
 
-	rl->iops_limit = iops_limit;
-	rl->bw_limit = bw_limit;
+	/* Store both global and local limits */
+	rl->global_iops_limit = iops_limit;
+	rl->global_bw_limit = bw_limit;
 	rl->burst_mult = burst_mult;
 
 	rl->iops_total = 0;
 	rl->bytes_total = 0;
 
-	rl->iops_capacity = (float)(iops_limit)*burst_mult;
-	rl->bytes_capacity = (float)(bw_limit)*burst_mult;
+	rl->cluster_mode = clustering_enabled && cluster_mode_config;
+
+	if (rl->cluster_mode) {
+		rl->msg_ctx = global_messaging_context();
+		rl->my_server_id = messaging_server_id(rl->msg_ctx);
+
+		/* Start with single-process assumption */
+		rl->num_active_processes = 1;
+		rl->local_iops_limit = iops_limit;
+		rl->local_bw_limit = bw_limit;
+
+		/* Connect to daemon */
+		rl->daemon_sock = connect_to_ratelimitd();
+		if (rl->daemon_sock < 0) {
+			DBG_WARNING("[%s snum:%d %s] Failed to connect to "
+				    "ratelimitd, "
+				    "disabling cluster mode\n",
+				    MODULE_NAME,
+				    rl->snum,
+				    rl->op);
+			rl->cluster_mode = false;
+			goto local_only;
+		}
+
+		/* Register for node summary messages */
+		messaging_register(rl->msg_ctx,
+				   rl,
+				   ratelimit_msg_type_summary(
+					   ratelimit_op_from_string(rl->op)),
+				   handle_node_summary_msg);
+
+		/* Initialize node tracking array */
+		rl->max_tracked_nodes = INITIAL_TRACKED_CAPACITY;
+		rl->num_tracked_nodes = 0;
+		rl->node_counts = talloc_zero_array(mem_ctx,
+						    struct node_count,
+						    rl->max_tracked_nodes);
+		if (rl->node_counts == NULL) {
+			DBG_ERR("[%s snum:%d %s] Failed to allocate node "
+				"tracking\n",
+				MODULE_NAME,
+				rl->snum,
+				rl->op);
+			close(rl->daemon_sock);
+			rl->daemon_sock = -1;
+			rl->cluster_mode = false;
+			goto local_only;
+		}
+
+		DBG_NOTICE("[%s snum:%d %s] Cluster mode enabled via daemon "
+			   "(capacity=%d)\n",
+			   MODULE_NAME,
+			   rl->snum,
+			   rl->op,
+			   rl->max_tracked_nodes);
+	} else {
+local_only:
+		rl->num_active_processes = 1;
+		rl->local_iops_limit = iops_limit;
+		rl->local_bw_limit = bw_limit;
+		rl->daemon_sock = -1;
+		rl->node_counts = NULL;
+		rl->num_tracked_nodes = 0;
+		rl->max_tracked_nodes = 0;
+
+		DBG_NOTICE("[%s snum:%d %s] Cluster mode DISABLED - using "
+			   "per-node limits "
+			   "(samba_clustering=%s, config_setting=%s)\n",
+			   MODULE_NAME,
+			   rl->snum,
+			   rl->op,
+			   clustering_enabled ? "enabled" : "disabled",
+			   cluster_mode_config ? "enabled" : "disabled");
+	}
+
+	rl->iops_capacity = (float)rl->local_iops_limit * burst_mult;
+	rl->bytes_capacity = (float)rl->local_bw_limit * burst_mult;
 
 	rl->last_usec = 0;
 	rl->last_save_usec = rl->last_usec;
@@ -371,20 +922,21 @@ static void ratelimiter_init(struct ratelimiter *rl,
 	/* Load from global TDB if available */
 	ratelimit_load_tdb(rl);
 
-	DBG_DEBUG("[%s snum:%d %s] init ratelimiter:"
-		  " iops_limit=%" PRId64 " bw_limit=%" PRId64
-		  " burst_mult=%.2f\n",
+	DBG_DEBUG("[%s snum:%d %s] Initialized ratelimiter: "
+		  "global_iops_limit=%" PRId64 " global_bw_limit=%" PRId64
+		  " burst_mult=%.2f cluster_mode=%s\n",
 		  MODULE_NAME,
 		  rl->snum,
 		  rl->op,
-		  rl->iops_limit,
-		  rl->bw_limit,
-		  rl->burst_mult);
+		  rl->global_iops_limit,
+		  rl->global_bw_limit,
+		  rl->burst_mult,
+		  rl->cluster_mode ? "yes" : "no");
 }
 
 static bool ratelimiter_enabled(const struct ratelimiter *rl)
 {
-	return (rl->iops_limit > 0) || (rl->bw_limit > 0);
+	return (rl->local_iops_limit > 0) || (rl->local_bw_limit > 0);
 }
 
 static float ratelimiter_calc_refill(uint64_t elapsed,
@@ -429,23 +981,23 @@ static void ratelimiter_refill(struct ratelimiter *rl)
 
 	elapsed = now - rl->last_usec;
 
-	if (rl->iops_limit > 0) {
+	if (rl->local_iops_limit > 0) {
 		float refill;
 
 		refill = ratelimiter_calc_refill(elapsed,
 						 rl->iops_capacity,
-						 rl->iops_limit);
+						 rl->local_iops_limit);
 
 		rl->iops_tokens = MIN(rl->iops_tokens + refill,
 				      rl->iops_capacity);
 	}
 
-	if (rl->bw_limit > 0) {
+	if (rl->local_bw_limit > 0) {
 		float refill;
 
 		refill = ratelimiter_calc_refill(elapsed,
 						 rl->bytes_capacity,
-						 rl->bw_limit);
+						 rl->local_bw_limit);
 
 		rl->bytes_tokens = MIN(rl->bytes_tokens + refill,
 				       rl->bytes_capacity);
@@ -482,23 +1034,30 @@ static uint32_t ratelimiter_pre_io(struct ratelimiter *rl, int64_t nbytes)
 	/* Refill tokens based on elapsed time */
 	ratelimiter_refill(rl);
 
+	/* Track in-flight I/O for cluster coordination */
+	if (rl->cluster_mode) {
+		rl->inflight_ios++;
+	}
+
 	/* Consume tokens for this operation */
-	if (rl->iops_limit > 0) {
+	if (rl->local_iops_limit > 0) {
 		rl->iops_tokens -= 1.0f;
 		if (rl->iops_tokens < 0.0f) {
 			iops_deficit = -rl->iops_tokens;
 		}
 	}
 
-	if (rl->bw_limit > 0) {
+	if (rl->local_bw_limit > 0) {
 		rl->bytes_tokens -= (float)nbytes;
 		if (rl->bytes_tokens < 0.0f) {
 			bw_deficit = -rl->bytes_tokens;
 		}
 	}
 
-	delay_usec = ratelimiter_deficit_to_delay(iops_deficit, rl->iops_limit);
-	bw_delay = ratelimiter_deficit_to_delay(bw_deficit, rl->bw_limit);
+	delay_usec = ratelimiter_deficit_to_delay(iops_deficit,
+						  rl->local_iops_limit);
+	bw_delay = ratelimiter_deficit_to_delay(bw_deficit,
+						rl->local_bw_limit);
 
 	if (bw_delay > delay_usec) {
 		delay_usec = bw_delay;
@@ -506,6 +1065,12 @@ static uint32_t ratelimiter_pre_io(struct ratelimiter *rl, int64_t nbytes)
 
 	rl->iops_total += 1;
 	rl->bytes_total += nbytes;
+
+	/* Track recent I/O for cluster coordination */
+	if (rl->cluster_mode) {
+		rl->recent_iops++;
+	}
+
 	now = time_now_usec();
 
 	if ((now - rl->last_save_usec) > SAVE_INTERVAL_USEC) {
@@ -513,14 +1078,24 @@ static uint32_t ratelimiter_pre_io(struct ratelimiter *rl, int64_t nbytes)
 		rl->last_save_usec = now;
 	}
 
+	/* Report to daemon for cluster coordination */
+	if (rl->cluster_mode && now - rl->last_report_to_daemon_us >
+					ACTIVITY_BROADCAST_INTERVAL_US)
+	{
+		report_to_daemon(rl);
+	}
+
 	DBG_DEBUG("[%s snum:%d %s] delay_usec=%" PRIu32
-		  " iops_tokens=%.2f bytes_tokens=%.2f\n",
+		  " iops_tokens=%.2f bytes_tokens=%.2f "
+		  "(local limits: iops=%" PRId64 " bw=%" PRId64 ")\n",
 		  MODULE_NAME,
 		  rl->snum,
 		  rl->op,
 		  delay_usec,
 		  rl->iops_tokens,
-		  rl->bytes_tokens);
+		  rl->bytes_tokens,
+		  rl->local_iops_limit,
+		  rl->local_bw_limit);
 
 	return delay_usec;
 }
@@ -529,7 +1104,12 @@ static void ratelimiter_post_io(struct ratelimiter *rl,
 				int64_t nbytes_want,
 				int64_t nbytes_done)
 {
-	if (rl->bw_limit > 0 && nbytes_done < nbytes_want) {
+	/* Update in-flight counter for cluster coordination */
+	if (rl->cluster_mode && rl->inflight_ios > 0) {
+		rl->inflight_ios--;
+	}
+
+	if (rl->local_bw_limit > 0 && nbytes_done < nbytes_want) {
 		int64_t unused = nbytes_want - MAX(nbytes_done, (int64_t)0);
 
 		rl->bytes_tokens = MIN(rl->bytes_tokens + (float)unused,
@@ -581,7 +1161,7 @@ static uint64_t vfs_aio_ratelimit_lp_parm_bw(int snum,
 	}
 
 	if (!conv_str_size_error(str, &val)) {
-		DBG_ERR("[%s] invalid value for %s: '%s'\n",
+		DBG_ERR("[%s] Invalid value for %s: '%s'\n",
 			MODULE_NAME,
 			option,
 			str);
@@ -596,6 +1176,10 @@ static void vfs_aio_ratelimit_setup(struct vfs_aio_ratelimit_config *config,
 {
 	int64_t iops_limit, bw_limit;
 	float burst_mult;
+	bool clustering_enabled;
+	bool cluster_mode_enabled;
+
+	clustering_enabled = lp_clustering();
 
 	/* --- Read limiter --- */
 	iops_limit = vfs_aio_ratelimit_lp_parm(snum,
@@ -611,12 +1195,23 @@ static void vfs_aio_ratelimit_setup(struct vfs_aio_ratelimit_config *config,
 						      BURST_MULT_DEF,
 						      100) / 10.0f;
 
-	ratelimiter_init(&config->rd_ratelimiter,
+	/*
+	 * Default: enable cluster mode if clustering is enabled
+	 * User can explicitly disable with cluster_mode = no
+	 */
+	cluster_mode_enabled = lp_parm_bool(snum,
+					    MODULE_NAME,
+					    "cluster_mode",
+					    clustering_enabled);
+
+	ratelimiter_init(config,
+			 &config->rd_ratelimiter,
 			 snum,
 			 "read",
 			 iops_limit,
 			 bw_limit,
-			 burst_mult);
+			 burst_mult,
+			 cluster_mode_enabled);
 
 	/* --- Write limiter --- */
 	iops_limit = vfs_aio_ratelimit_lp_parm(snum,
@@ -632,16 +1227,28 @@ static void vfs_aio_ratelimit_setup(struct vfs_aio_ratelimit_config *config,
 						      BURST_MULT_DEF,
 						      100) / 10.0f;
 
-	ratelimiter_init(&config->wr_ratelimiter,
+	ratelimiter_init(config,
+			 &config->wr_ratelimiter,
 			 snum,
 			 "write",
 			 iops_limit,
 			 bw_limit,
-			 burst_mult);
+			 burst_mult,
+			 cluster_mode_enabled);
 }
 
 static void vfs_aio_ratelimit_free_config(void **ptr)
 {
+	struct vfs_aio_ratelimit_config *config = *(
+		struct vfs_aio_ratelimit_config **)ptr;
+
+	if (config == NULL) {
+		return;
+	}
+
+	ratelimiter_cleanup(&config->rd_ratelimiter);
+	ratelimiter_cleanup(&config->wr_ratelimiter);
+
 	TALLOC_FREE(*ptr);
 }
 
@@ -688,8 +1295,7 @@ static int vfs_aio_ratelimit_connect(struct vfs_handle_struct *handle,
 
 	ret = vfs_aio_ratelimit_new_config(handle);
 	if (ret < 0) {
-		DBG_ERR("[%s] failed to create new config: "
-			"service=%s snum=%d\n",
+		DBG_ERR("[%s] Failed to create config: service=%s snum=%d\n",
 			MODULE_NAME,
 			service,
 			SNUM(handle->conn));
@@ -710,6 +1316,9 @@ static void vfs_aio_ratelimit_disconnect(struct vfs_handle_struct *handle)
 				config,
 				struct vfs_aio_ratelimit_config,
 				goto out);
+
+	ratelimiter_cleanup(&config->rd_ratelimiter);
+	ratelimiter_cleanup(&config->wr_ratelimiter);
 
 	/* Save state before disconnect */
 	ratelimit_save_tdb(&config->rd_ratelimiter);
