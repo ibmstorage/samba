@@ -109,6 +109,11 @@ struct tevent_context;
 	SMBPROFILE_STATS_BASIC(syscall_brl_unlock) \
 	SMBPROFILE_STATS_BASIC(syscall_brl_cancel) \
 	SMBPROFILE_STATS_BYTES(syscall_asys_getxattrat) \
+	SMBPROFILE_STATS_BASIC(syscall_fgetxattr) \
+	SMBPROFILE_STATS_BASIC(syscall_flistxattr) \
+	SMBPROFILE_STATS_BASIC(syscall_fremovexattr) \
+	SMBPROFILE_STATS_BASIC(syscall_fsetxattr) \
+	SMBPROFILE_STATS_BASIC(syscall_fstatvfs) \
 	SMBPROFILE_STATS_SECTION_END \
 	\
 	SMBPROFILE_STATS_SECTION_START(acl, "ACL Calls") \
@@ -312,6 +317,11 @@ struct tevent_context;
 	SMBPROFILE_STATS_BASIC(syscall_brl_unlock) \
 	SMBPROFILE_STATS_BASIC(syscall_brl_cancel) \
 	SMBPROFILE_STATS_BYTES(syscall_asys_getxattrat) \
+	SMBPROFILE_STATS_BASIC(syscall_fgetxattr) \
+	SMBPROFILE_STATS_BASIC(syscall_flistxattr) \
+	SMBPROFILE_STATS_BASIC(syscall_fremovexattr) \
+	SMBPROFILE_STATS_BASIC(syscall_fsetxattr) \
+	SMBPROFILE_STATS_BASIC(syscall_fstatvfs) \
 	SMBPROFILE_STATS_SECTION_END \
 	\
 	SMBPROFILE_STATS_SECTION_START(acl, "ACL Calls") \
