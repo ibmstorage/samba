@@ -54,7 +54,9 @@
 #include "locking/leases_db.h"
 #include "smbd/notifyd/notifyd.h"
 #include "smbd/smbd_cleanupd.h"
+#ifdef WITH_RATELIMITD
 #include "smbd/smbd_ratelimitd.h"
+#endif
 #include "lib/util/sys_rw.h"
 #include "cleanupdb.h"
 #include "g_lock.h"
@@ -91,7 +93,9 @@ struct smbd_parent_context {
 
 	struct server_id cleanupd;
 	struct server_id notifyd;
+#ifdef WITH_RATELIMITD
 	struct server_id ratelimitd;
+#endif
 
 	struct tevent_timer *cleanup_te;
 
@@ -878,7 +882,7 @@ static void cleanupd_started(struct tevent_req *req)
 /**************************************************************************
  * ratelimitd - cluster-wide rate limit coordination daemon
  **************************************************************************/
-
+#ifdef WITH_RATELIMITD
 static void ratelimitd_stopped(struct tevent_req *req)
 {
 	NTSTATUS status;
@@ -1055,6 +1059,7 @@ static void ratelimitd_started(struct tevent_req *req)
 		return;
 	}
 }
+#endif /* WITH_RATELIMITD */
 
 static void remove_child_pid(struct smbd_parent_context *parent,
 			     pid_t pid,
@@ -1118,6 +1123,7 @@ static void remove_child_pid(struct smbd_parent_context *parent,
 		return;
 	}
 
+#ifdef WITH_RATELIMITD
 	if (pid == procid_to_pid(&parent->ratelimitd)) {
 		struct tevent_req *req;
 		struct tevent_context *ev = messaging_tevent_context(
@@ -1137,6 +1143,7 @@ static void remove_child_pid(struct smbd_parent_context *parent,
 		tevent_req_set_callback(req, ratelimitd_started, parent);
 		return;
 	}
+#endif /* WITH_RATELIMITD */
 
 	ok = cleanupdb_store_child(pid, unclean_shutdown);
 	if (!ok) {
@@ -2637,6 +2644,7 @@ quic_disabled:
 		exit_daemon("Samba cannot init the cleanupd", EACCES);
 	}
 
+#ifdef WITH_RATELIMITD
 	if (!smbd_ratelimitd_init(msg_ctx,
 				  cmdline_daemon_cfg->interactive,
 				  &parent->ratelimitd))
@@ -2644,6 +2652,7 @@ quic_disabled:
 		DBG_WARNING("ratelimitd init failed, "
 			    "cluster rate limiting will not be available\n");
 	}
+#endif /* WITH_RATELIMITD */
 
 	if (!messaging_parent_dgm_cleanup_init(msg_ctx)) {
 		exit(1);
