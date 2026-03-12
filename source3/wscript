@@ -89,6 +89,10 @@ def options(opt):
 
     opt.samba_add_onoff_option('glusterfs', with_name="enable", without_name="disable", default=True)
     opt.samba_add_onoff_option('cephfs', with_name="enable", without_name="disable", default=None)
+    opt.samba_add_onoff_option('ratelimitd',
+                                help=("Enable cluster rate limiting coordination daemon (requires clustering)"),
+                                default=False)
+
 
     opt.add_option('--enable-vxfs',
                   help=("enable support for VxFS (default=no)"),
@@ -1685,6 +1689,10 @@ int main(void) {
         else:
             Logs.warn("acl support disabled or ceph_statx/ceph_openat not "
                        "available, not building ceph vfs modules")
+
+    if Options.options.with_ratelimitd:
+        conf.DEFINE('WITH_RATELIMITD', 1)
+        Logs.info("Enabling rate limiting daemon")
 
     if Options.options.with_glusterfs:
         conf.CHECK_CFG(package='glusterfs-api', args='"glusterfs-api >= 4" --cflags --libs',
