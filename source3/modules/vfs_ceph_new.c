@@ -4348,10 +4348,10 @@ static ssize_t vfs_ceph_flistxattr(struct vfs_handle_struct *handle,
 					    list,
 					    size,
 					    &list_size);
+		vfs_ceph_iput(handle, &iref);
 		if (ret != 0) {
 			goto out;
 		}
-		vfs_ceph_iput(handle, &iref);
 	}
 	ret = (int)list_size;
 out:
