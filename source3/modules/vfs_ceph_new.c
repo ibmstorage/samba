@@ -687,6 +687,7 @@ static bool vfs_ceph_load_config(struct vfs_handle_struct *handle,
 					       VFS_CEPHFS_PROXY_NO);
 	if (config_tmp->proxy == -1) {
 		DBG_ERR("[CEPH] value for proxy: mode unknown\n");
+		TALLOC_FREE(config_tmp);
 		return false;
 	}
 	config_tmp->fscrypt = lp_parm_enum(snum,
@@ -696,6 +697,7 @@ static bool vfs_ceph_load_config(struct vfs_handle_struct *handle,
 					   VFS_CEPHFS_FSCRYPT_DISABLED);
 	if (config_tmp->fscrypt == -1) {
 		DBG_ERR("[CEPH] value for fscrypt: unknown\n");
+		TALLOC_FREE(config_tmp);
 		return false;
 	}
 #if HAVE_CEPH_FSCRYPT
@@ -713,6 +715,7 @@ static bool vfs_ceph_load_config(struct vfs_handle_struct *handle,
 
 	ok = vfs_cephfs_load_lib(config_tmp);
 	if (!ok) {
+		TALLOC_FREE(config_tmp);
 		return false;
 	}
 
