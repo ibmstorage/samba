@@ -176,7 +176,7 @@ builddirs = {
 }
 
 ctdb_configure_params = " --enable-developer ${PREFIX}"
-samba_configure_params = " ${ENABLE_COVERAGE} ${PREFIX} --with-profiling-data --with-prometheus-exporter"
+samba_configure_params = " ${ENABLE_COVERAGE} ${PREFIX} --with-profiling-data --with-prometheus-exporter --with-ratelimitd"
 
 # We cannot configure himmelblau on old systems missing openssl 3, with glibc
 # older than version 2.32, or when cargo isn't available.
