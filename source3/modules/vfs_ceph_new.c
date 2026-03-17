@@ -700,18 +700,17 @@ static bool vfs_ceph_load_config(struct vfs_handle_struct *handle,
 		TALLOC_FREE(config_tmp);
 		return false;
 	}
-#if HAVE_CEPH_FSCRYPT
+
 	if (config_tmp->fscrypt == VFS_CEPHFS_FSCRYPT_KEYBRIDGE) {
+#if HAVE_CEPH_FSCRYPT
 		if (parse_keybridge_config(snum, module_name, config_tmp)) {
 			fetch_keybridge_config(config_tmp);
 		}
-	}
 #else
-	if (config_tmp->fscrypt == VFS_CEPHFS_FSCRYPT_KEYBRIDGE) {
 		DBG_ERR("[CEPH] fscrypt support configured but"
 			" not enabled during build, ignoring\n");
-	}
 #endif
+	}
 
 	ok = vfs_cephfs_load_lib(config_tmp);
 	if (!ok) {
