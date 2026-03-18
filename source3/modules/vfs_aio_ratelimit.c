@@ -199,10 +199,10 @@ static bool ensure_node_count_capacity(struct ratelimiter *rl)
 
 	new_max = rl->max_tracked_nodes * 2;
 
-	new_array = talloc_realloc_zero(NULL,
-					rl->node_counts,
-					struct node_count,
-					new_max);
+	new_array = talloc_realloc(NULL,
+				   rl->node_counts,
+				   struct node_count,
+				   new_max);
 	if (new_array == NULL) {
 		DBG_ERR("[%s snum:%d %s] Failed to grow node_counts: %d -> "
 			"%d\n",
@@ -213,6 +213,10 @@ static bool ensure_node_count_capacity(struct ratelimiter *rl)
 			new_max);
 		return false;
 	}
+
+	memset(&new_array[rl->max_tracked_nodes],
+	       0,
+	       sizeof(struct node_count) * rl->max_tracked_nodes);
 
 	rl->node_counts = new_array;
 	rl->max_tracked_nodes = new_max;
