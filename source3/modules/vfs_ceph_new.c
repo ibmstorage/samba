@@ -4355,7 +4355,7 @@ static ssize_t vfs_ceph_flistxattr(struct vfs_handle_struct *handle,
 			goto out;
 		}
 	}
-	ret = (int)list_size;
+	ret = (ssize_t)list_size;
 out:
 	DBG_DEBUG("[CEPH] flistxattr done: ret=%zd\n", ret);
 	END_PROFILE_X(syscall_flistxattr);
