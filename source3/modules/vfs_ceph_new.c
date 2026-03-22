@@ -4126,10 +4126,6 @@ static int vfs_ceph_linkat(struct vfs_handle_struct *handle,
 	}
 
 	result = vfs_ceph_ll_link(handle, dst_dircfh, newname, &iref);
-	if (result != 0) {
-		goto out;
-	}
-
 	vfs_ceph_iput(handle, &iref);
 out:
 	DBG_DEBUG("[CEPH] link done: result=%d\n", result);
