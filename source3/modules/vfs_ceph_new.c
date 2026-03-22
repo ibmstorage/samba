@@ -1057,6 +1057,9 @@ static int vfs_ceph_ll_walk(const struct vfs_handle_struct *handle,
 				return -ENOMEM);
 
 	cwd = config->ceph_getcwd_fn(config->mount);
+	if (cwd == NULL) {
+		return -ENOMEM;
+	}
 	cwdlen = strlen(cwd);
 
 	/*
