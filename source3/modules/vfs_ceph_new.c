@@ -2867,7 +2867,7 @@ static void vfs_ceph_aio_finish(struct vfs_ceph_aio_state *state,
 	state->vfs_aio_state.duration = nsec_time_diff(&state->finish_time,
 						       &state->start_time);
 	if (result < 0) {
-		state->vfs_aio_state.error = (int)result;
+		state->vfs_aio_state.error = -((int)result);
 	}
 
 	state->result = result;
