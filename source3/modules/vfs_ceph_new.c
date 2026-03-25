@@ -110,6 +110,7 @@ static const struct enum_list enum_vfs_cephfs_fscrypt_vals[] = {
 	{VFS_CEPHFS_FSCRYPT_DISABLED, "disabled"},
 	{VFS_CEPHFS_FSCRYPT_DISABLED, "none"},
 	{VFS_CEPHFS_FSCRYPT_KEYBRIDGE, "keybridge"},
+	{-1, NULL},
 };
 
 struct vfs_ceph_fscrypt_key {
