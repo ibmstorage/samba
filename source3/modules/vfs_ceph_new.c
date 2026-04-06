@@ -3874,7 +3874,7 @@ static int vfs_ceph_ftruncate(struct vfs_handle_struct *handle,
 		  (intmax_t)len);
 
 	if (lp_strict_allocate(SNUM(fsp->conn))) {
-		END_PROFILE(syscall_ftruncate);
+		END_PROFILE_X(syscall_ftruncate);
 		return strict_allocate_ftruncate(handle, fsp, len);
 	}
 
