@@ -2678,7 +2678,6 @@ static int vfs_ceph_closedir(struct vfs_handle_struct *handle, DIR *dirp)
 	START_PROFILE_X(SNUM(handle->conn), syscall_closedir);
 	DBG_DEBUG("[CEPH] closedir: dirp=%p\n", dirp);
 	result = vfs_ceph_ll_releasedir(handle, cfh);
-	vfs_ceph_release_fh(cfh);
 	vfs_ceph_remove_fh(handle, cfh->fsp);
 	DBG_DEBUG("[CEPH] closedir: dirp=%p result=%d\n", dirp, result);
 	END_PROFILE_X(syscall_closedir);
