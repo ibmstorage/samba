@@ -880,7 +880,9 @@ static void ratelimiter_cleanup(struct ratelimiter *rl)
 	rl->max_tracked_nodes = 0;
 }
 
-static void ratelimiter_init_local_only(struct ratelimiter *rl)
+static void ratelimiter_init_local_only(struct ratelimiter *rl,
+					bool clustering_enabled,
+					bool cluster_mode_config)
 {
 	rl->num_active_processes = 1;
 	rl->local_iops_limit = rl->global_iops_limit;
@@ -892,11 +894,12 @@ static void ratelimiter_init_local_only(struct ratelimiter *rl)
 
 	DBG_NOTICE("[%s snum:%d %s] Cluster mode DISABLED - using "
 		   "per-node limits "
-		   "samba_clustering=%s\n",
+		   "(samba_clustering=%s, config_setting=%s)\n",
 		   MODULE_NAME,
 		   rl->snum,
 		   rl->op,
-		   rl->cluster_mode ? "enabled" : "disabled");
+		   clustering_enabled ? "enabled" : "disabled",
+		   cluster_mode_config ? "enabled" : "disabled");
 }
 
 static void ratelimiter_init(TALLOC_CTX *mem_ctx,
@@ -905,7 +908,9 @@ static void ratelimiter_init(TALLOC_CTX *mem_ctx,
 			     const char *op,
 			     int64_t iops_limit,
 			     int64_t bw_limit,
-			     float burst_mult)
+			     float burst_mult,
+			     bool clustering_enabled,
+			     bool cluster_mode_config)
 {
 	const struct loadparm_substitution
 		*lp_sub = loadparm_s3_global_substitution();
@@ -928,7 +933,7 @@ static void ratelimiter_init(TALLOC_CTX *mem_ctx,
 	rl->iops_total = 0;
 	rl->bytes_total = 0;
 
-	rl->cluster_mode = lp_clustering();
+	rl->cluster_mode = clustering_enabled && cluster_mode_config;
 
 	if (rl->cluster_mode) {
 		rl->msg_ctx = global_messaging_context();
@@ -950,7 +955,9 @@ static void ratelimiter_init(TALLOC_CTX *mem_ctx,
 				    rl->op);
 			rl->msg_ctx = NULL;
 			rl->cluster_mode = false;
-			ratelimiter_init_local_only(rl);
+			ratelimiter_init_local_only(rl,
+						    clustering_enabled,
+						    cluster_mode_config);
 		} else {
 			rl->max_tracked_nodes = INITIAL_TRACKED_CAPACITY;
 			rl->num_tracked_nodes = 0;
@@ -968,7 +975,10 @@ static void ratelimiter_init(TALLOC_CTX *mem_ctx,
 				close(rl->daemon_sock);
 				rl->msg_ctx = NULL;
 				rl->cluster_mode = false;
-				ratelimiter_init_local_only(rl);
+				ratelimiter_init_local_only(
+					rl,
+					clustering_enabled,
+					cluster_mode_config);
 			} else {
 				struct ratelimiter **list =
 					ratelimiter_dispatch_list(rl->op);
@@ -1005,7 +1015,9 @@ static void ratelimiter_init(TALLOC_CTX *mem_ctx,
 			}
 		}
 	} else {
-		ratelimiter_init_local_only(rl);
+		ratelimiter_init_local_only(rl,
+					    clustering_enabled,
+					    cluster_mode_config);
 	}
 
 	rl->iops_capacity = (float)rl->local_iops_limit * burst_mult;
@@ -1273,6 +1285,19 @@ static void vfs_aio_ratelimit_setup(struct vfs_aio_ratelimit_config *config,
 {
 	int64_t iops_limit, bw_limit;
 	float burst_mult;
+	bool clustering_enabled;
+	bool cluster_mode_enabled;
+
+	clustering_enabled = lp_clustering();
+
+	/*
+	 * Default: enable cluster mode if clustering is enabled.
+	 * User can explicitly disable with cluster_mode = no.
+	 */
+	cluster_mode_enabled = lp_parm_bool(snum,
+					    MODULE_NAME,
+					    "cluster_mode",
+					    clustering_enabled);
 
 	/* --- Read limiter --- */
 	iops_limit = vfs_aio_ratelimit_lp_parm(snum,
@@ -1294,7 +1319,9 @@ static void vfs_aio_ratelimit_setup(struct vfs_aio_ratelimit_config *config,
 			 "read",
 			 iops_limit,
 			 bw_limit,
-			 burst_mult);
+			 burst_mult,
+			 clustering_enabled,
+			 cluster_mode_enabled);
 
 	/* --- Write limiter --- */
 	iops_limit = vfs_aio_ratelimit_lp_parm(snum,
@@ -1316,7 +1343,9 @@ static void vfs_aio_ratelimit_setup(struct vfs_aio_ratelimit_config *config,
 			 "write",
 			 iops_limit,
 			 bw_limit,
-			 burst_mult);
+			 burst_mult,
+			 clustering_enabled,
+			 cluster_mode_enabled);
 }
 
 static void vfs_aio_ratelimit_free_config(void **ptr)
