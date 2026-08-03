@@ -51,6 +51,8 @@
 	automatically enabled by default. Each share's configured rate limit
 	applies to that share across the entire cluster. Limits for different
 	shares are tracked and enforced independently of one another.
+	This behavior can be disabled with the <command>cluster_mode</command>
+	parameter if per-node limits are desired instead.
 	</para>
 
 	<para>
@@ -96,6 +98,7 @@
 	<smbconfoption name="path">/mnt/shared</smbconfoption>
 	<smbconfoption name="vfs objects">aio_ratelimit</smbconfoption>
 	<smbconfoption name="aio_ratelimit:read_iops_limit">10000</smbconfoption>
+	<smbconfoption name="aio_ratelimit:cluster_mode">no</smbconfoption>
 </programlisting>
 
 	<para>Each node independently enforces the 10000 IOPS limit.</para>
@@ -208,6 +211,27 @@
 		</listitem>
 		</varlistentry>
 
+		<varlistentry>
+		<term>aio_ratelimit:cluster_mode = boolean</term>
+		<listitem>
+		<para>
+			Enable or disable cluster-wide rate limiting coordination.
+			When enabled, rate limits are enforced cluster-wide and
+			automatically distributed among all active smbd processes.
+			When disabled, each node enforces the full configured limit
+			independently (per-node mode).
+		</para>
+		<para>
+			By default, cluster mode is automatically enabled when Samba
+			clustering is active, and disabled otherwise. This parameter
+			allows explicit control to disable cluster coordination even
+			when clustering is enabled.
+		</para>
+		<para>Default: yes (if clustering enabled), no (otherwise)</para>
+		<para>Example: aio_ratelimit:cluster_mode = no</para>
+		</listitem>
+		</varlistentry>
+
 	</variablelist>
 </refsect1>
 
@@ -222,9 +246,15 @@
 	time with <command>--with-ratelimitd</command>.
 	</para>
 
+	<para>
+	To disable cluster-wide coordination and enforce limits per-node instead,
+	set <command>cluster_mode = no</command>:
+	</para>
+
 <programlisting>
 	<smbconfsection name="[share]"/>
 	<smbconfoption name="aio_ratelimit:read_iops_limit">1000</smbconfoption>
+	<smbconfoption name="aio_ratelimit:cluster_mode">no</smbconfoption>
 </programlisting>
 
 	<para>
