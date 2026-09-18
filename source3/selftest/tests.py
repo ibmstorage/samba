@@ -2058,7 +2058,8 @@ if have_cluster_support:
     CLUSTERED_LOCAL_TESTS = [
         "ctdbd-conn1",
         "local-dbwrap-ctdb1",
-        "LOCAL-DBWRAP-PER-REC-PERSISTENCY"
+        "LOCAL-DBWRAP-PER-REC-PERSISTENCY",
+        "LOCAL-CLUSTER-LEVEL-DB"
     ]
 
     for t in CLUSTERED_LOCAL_TESTS:
